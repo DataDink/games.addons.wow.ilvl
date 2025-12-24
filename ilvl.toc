@@ -2,7 +2,6 @@
 ## Title: ilvl
 ## Notes: Scan gearscores and display on party/raid frames.
 ## Author: DataDink
-## Version: 0.1.0
+## Version: 1.0.0
 ## SavedVariables: ilvlDB
-
 ilvl.lua
