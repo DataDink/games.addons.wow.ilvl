@@ -1,195 +1,117 @@
-local ADDON = ...
-ilvlDB = ilvlDB or {}
+local addonName = ...
 
 local f = CreateFrame("Frame")
-f:RegisterEvent("PLAYER_LOGIN")
-f:RegisterEvent("GROUP_ROSTER_UPDATE")
-f:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
+f:RegisterEvent("ADDON_LOADED")
 f:RegisterEvent("INSPECT_READY")
 
--- Cache: guid -> number (score) or nil (unknown)
-local cache = {}
+local text
+local pendingGUID
 
--- Throttle inspect attempts to avoid spamming
-local lastInspectAt = 0
-local INSPECT_COOLDOWN = 1.0
+-- Only count real gear slots (exclude shirt/tabard).
+local ILVL_SLOTS = {
+  INVSLOT_HEAD,
+  INVSLOT_NECK,
+  INVSLOT_SHOULDER,
+  INVSLOT_CHEST,
+  INVSLOT_WAIST,
+  INVSLOT_LEGS,
+  INVSLOT_FEET,
+  INVSLOT_WRIST,
+  INVSLOT_HAND,
+  INVSLOT_FINGER1,
+  INVSLOT_FINGER2,
+  INVSLOT_TRINKET1,
+  INVSLOT_TRINKET2,
+  INVSLOT_BACK,
+  INVSLOT_MAINHAND,
+  INVSLOT_OFFHAND,
+}
 
--- Keep track of who we are currently inspecting
-local inspectingGuid = nil
+local function EnsureText()
+  if text or not InspectFrame then return end
 
-local function Now()
-  return GetTime()
+  text = InspectFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+  -- Above the titlebar
+  text:SetPoint("TOP", InspectFrame, "TOP", 0, 14)
+  text:SetText("")
 end
 
-local function GetGuid(unit)
-  if not UnitExists(unit) then return nil end
-  return UnitGUID(unit)
-end
+-- Why this works:
+-- - INSPECT_READY populates links for GetInventoryItemLink("target", slot)
+-- - We read each equipped item, get its effective item level, and average them.
+-- - We exclude INVSLOT_SHIRT and INVSLOT_TABARD by never iterating them.
+local function GetInspectAvgEquippedIlvl(unit)
+  local total, count = 0, 0
 
-local function ComputeSelfScore()
-  -- Example score: average equipped item level rounded
-  local avg, equipped = GetAverageItemLevel()
-  if equipped and equipped > 0 then
-    return math.floor(equipped + 0.5)
+  for i = 1, #ILVL_SLOTS do
+    local slotId = ILVL_SLOTS[i]
+    local link = GetInventoryItemLink(unit, slotId)
+    if link then
+      -- Returns the "effective" iLvl for the item link (handles upgrades/scaling).
+      local ilvl = GetDetailedItemLevelInfo(link)
+      if ilvl and ilvl > 0 then
+        total = total + ilvl
+        count = count + 1
+      end
+    end
   end
-  if avg and avg > 0 then
-    return math.floor(avg + 0.5)
-  end
-  return nil
+
+  if count == 0 then return nil end
+  return total / count
 end
 
-local function ComputeInspectScore(unit)
-  -- Uses inspected unit data (must be valid after INSPECT_READY)
-  -- Note: Some API variants differ by version; this is the common approach.
-  local avg = C_PaperDollInfo.GetInspectItemLevel(unit)
-  if avg and avg > 0 then
-    return math.floor(avg + 0.5)
+local function SetTextForUnit(unit)
+  if not text then return end
+  if not unit or not UnitExists(unit) then
+    text:SetText("")
+    return
   end
-  return nil
-end
 
-local function CanInspect(unit)
-  if not UnitIsPlayer(unit) then return false end
-  if UnitIsUnit(unit, "player") then return false end
-  if not CanInspect(unit) then return false end -- global API CanInspect(unit)
-  return true
+  local ilvl = GetInspectAvgEquippedIlvl(unit)
+  if ilvl then
+    text:SetFormattedText("iLvl: %.1f", ilvl)
+  else
+    text:SetText("iLvl: ...")
+  end
 end
 
 local function RequestInspect(unit)
-  if InCombatLockdown() then return end
-  if not CanInspect(unit) then return end
+  if not unit or not UnitExists(unit) then return end
+  if not CanInspect(unit, false) then return end
 
-  local t = Now()
-  if (t - lastInspectAt) < INSPECT_COOLDOWN then return end
-  lastInspectAt = t
-
-  inspectingGuid = GetGuid(unit)
-  if not inspectingGuid then return end
-
+  pendingGUID = UnitGUID(unit)
+  text:SetText("iLvl: ...")
   NotifyInspect(unit)
 end
 
--- ---- Frame attachment (Blizzard party/raid frames) ----
+local function HookInspectFrame()
+  if not InspectFrame or InspectFrame.__InspectAvgIlvlHooked then return end
+  InspectFrame.__InspectAvgIlvlHooked = true
 
-local function EnsureLabel(frame)
-  if frame.GSF_Label then return frame.GSF_Label end
+  EnsureText()
 
-  local label = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  label:SetPoint("RIGHT", frame, "RIGHT", -2, 0)
-  label:SetJustifyH("RIGHT")
-  label:SetText("??")
+  InspectFrame:HookScript("OnShow", function()
+    EnsureText()
+    RequestInspect(InspectFrame.unit or "target")
+  end)
 
-  frame.GSF_Label = label
-  return label
-end
-
-local function SetFrameText(frame, text)
-  local label = EnsureLabel(frame)
-  label:SetText(text)
-end
-
-local function ScoreTextForUnit(unit)
-  local guid = GetGuid(unit)
-  if not guid then return "??" end
-
-  -- Self
-  if UnitIsUnit(unit, "player") then
-    local s = ComputeSelfScore()
-    if s then
-      cache[guid] = s
-      return tostring(s)
-    end
-    return "??"
-  end
-
-  local s = cache[guid]
-  if s then
-    return tostring(s)
-  end
-
-  -- Unknown -> request inspect and show ??
-  RequestInspect(unit)
-  return "??"
-end
-
-local function TryUpdateBlizzardPartyFrames()
-  if not PartyFrame or not PartyFrame.MemberFramePool then return end
-
-  for memberFrame in PartyFrame.MemberFramePool:EnumerateActive() do
-    local unit = memberFrame.unit
-    if unit then
-      SetFrameText(memberFrame, ScoreTextForUnit(unit))
-    end
-  end
-end
-
-local function TryUpdateBlizzardRaidFrames()
-  -- Uses CompactUnitFrame based raid frames
-  if not CompactRaidFrameContainer or not CompactRaidFrameContainer.memberFramePool then return end
-
-  for frame in CompactRaidFrameContainer.memberFramePool:EnumerateActive() do
-    local unit = frame.unit
-    if unit then
-      SetFrameText(frame, ScoreTextForUnit(unit))
-    end
-  end
-end
-
-local function UpdateAll()
-  TryUpdateBlizzardPartyFrames()
-  TryUpdateBlizzardRaidFrames()
-end
-
--- ---- Events ----
-
-f:SetScript("OnEvent", function(self, event, ...)
-  if event == "PLAYER_LOGIN" then
-    -- Hook updates when compact frames refresh
-    hooksecurefunc("CompactUnitFrame_UpdateAll", function()
-      -- CompactUnitFrame_UpdateAll is called a lot; keep it lightweight
-      UpdateAll()
-    end)
-    UpdateAll()
-
-  elseif event == "GROUP_ROSTER_UPDATE" then
-    UpdateAll()
-
-  elseif event == "PLAYER_EQUIPMENT_CHANGED" then
-    -- Update self score in cache
-    local guid = UnitGUID("player")
-    if guid then
-      cache[guid] = ComputeSelfScore()
-    end
-    UpdateAll()
-
-  elseif event == "INSPECT_READY" then
-    local guid = ...
-    if not guid or guid ~= inspectingGuid then
-      -- Still update; other inspect results could arrive
-    end
-
-    -- Find which unit matches this guid (party/raid iterate)
-    local function handleUnit(unit)
-      if UnitGUID(unit) == guid then
-        local score = ComputeInspectScore(unit)
-        if score then
-          cache[guid] = score
-        end
-      end
-    end
-
-    if IsInRaid() then
-      for i = 1, GetNumGroupMembers() do
-        handleUnit("raid"..i)
-      end
-    elseif IsInGroup() then
-      for i = 1, GetNumSubgroupMembers() do
-        handleUnit("party"..i)
-      end
-    end
-
-    inspectingGuid = nil
+  InspectFrame:HookScript("OnHide", function()
+    if text then text:SetText("") end
+    pendingGUID = nil
     ClearInspectPlayer()
-    UpdateAll()
+  end)
+end
+
+f:SetScript("OnEvent", function(_, event, arg1)
+  if event == "ADDON_LOADED" then
+    if arg1 ~= addonName then return end
+    HookInspectFrame()
+    return
+  end
+
+  if event == "INSPECT_READY" then
+    if pendingGUID and arg1 and arg1 ~= pendingGUID then return end
+    EnsureText()
+    SetTextForUnit(InspectFrame and (InspectFrame.unit or "target") or "target")
   end
 end)

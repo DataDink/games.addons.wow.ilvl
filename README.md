@@ -1,2 +1,2 @@
 # ilvl
-A WoW addon to scan and display ilvl on party/raid UI
+A WoW addon to add the gearscore to the inspect frame.

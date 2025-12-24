@@ -1,7 +1,6 @@
 ## Interface: 110207
 ## Title: ilvl
-## Notes: Scan gearscores and display on party/raid frames.
+## Notes: Adds the gearscore to the inspect frame.
 ## Author: DataDink
 ## Version: 1.0.0
-## SavedVariables: ilvlDB
 ilvl.lua
